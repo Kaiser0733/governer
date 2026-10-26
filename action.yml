@@ -1,0 +1,17 @@
+name: governer cost gate
+description: Fail a pull request whose agent run cost more than the budget
+inputs:
+  usage-file:
+    description: JSON array or JSONL of usage records (Anthropic, OpenAI or OpenRouter field names)
+    required: true
+  budget:
+    description: Budget in USD
+    required: false
+    default: "1.00"
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: >-
+        python3 "${{ github.action_path }}/governer.py" check
+        "${{ inputs.usage-file }}" --fail-over "${{ inputs.budget }}"

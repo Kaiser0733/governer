@@ -8,8 +8,10 @@ the agent at the line you set.
 Zero dependencies. One file. Python 3.9+.
 
   governer prices [--upcoming] [--json]
+  governer free
   governer box    [--limit 10] [--model gpt-6-astra] [--context 200000]
-  governer check  usage.json [--limit 200]
+  governer proxy  [--limit 5] [--port 8787] [--upstream URL]
+  governer check  usage.json [--limit 200] [--fail-over 50]
   governer verify ledger.jsonl
 """
 from __future__ import annotations
@@ -19,7 +21,11 @@ import hashlib
 import json
 import os
 import sys
+import threading
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRICES_PATH = os.environ.get("GOVERNER_PRICES", os.path.join(HERE, "prices.json"))
@@ -150,7 +156,7 @@ def verify_ledger(path):
         if rec.get("hash") != _hash(rec):
             return False, n, f"record {n + 1} was edited after it was written"
         prev, n, total = rec["hash"], n + 1, total + rec.get("cost", 0)
-    return True, n, f"{n} records · ${total:.2f} · chain intact"
+    return True, n, f"{n} records · ${total:.4f} · chain intact"
 
 
 # ---------------------------------------------------------------- commands
@@ -261,22 +267,197 @@ def cmd_check(args):
     print(f"true cost  ${total:.2f}")
     if misses:
         print(f"cache miss {misses} request(s) billed uncached while sending ≥10k tokens")
-        print(f"           ${waste:.2f} of that was avoidable — ~{waste / total * 100:.0f}% of the bill")
+        if total > 0:
+            print(f"           ${waste:.2f} of that was avoidable — ~{waste / total * 100:.0f}% of the bill")
     for w in sorted(warnings):
         print(f"warning    {w}")
     if wallet:
         if trip_at:
-            kept = total - trip_at[1] + 0
+            kept = total - trip_at[1]
+            saved = f" ({(1 - trip_at[1] / total) * 100:.0f}% saved)" if total > 0 else ""
             print(f"at ${wallet.limit:.2f} cap: stopped at request {trip_at[0]}, "
-                  f"${kept:.2f} never spent ({(1 - trip_at[1] / total) * 100:.0f}% saved)")
+                  f"${kept:.2f} never spent{saved}")
         else:
             print(f"at ${wallet.limit:.2f} cap: would not have tripped")
+    if args.fail_over is not None and total > args.fail_over:
+        print(f"FAIL — ${total:.2f} is over the ${args.fail_over:.2f} gate")
+        sys.exit(1)
 
 
 def cmd_verify(args):
     ok, n, msg = verify_ledger(args.file)
     print(f"{'OK' if ok else 'BROKEN'} — {msg}")
     sys.exit(0 if ok else 1)
+
+
+def cmd_free(args):
+    """Live check: which models are free right now (OpenRouter's public catalogue)."""
+    with urllib.request.urlopen(args.api.rstrip("/") + "/models", timeout=30) as r:
+        data = json.load(r)["data"]
+    free = [m for m in data
+            if str(m.get("pricing", {}).get("prompt")) in ("0", "0.0", "0.00")
+            and str(m.get("pricing", {}).get("completion")) in ("0", "0.0", "0.00")]
+    print(f"{len(free)} of {len(data)} models are free right now ({now()[:10]})")
+    for m in sorted(free, key=lambda m: -(m.get("context_length") or 0)):
+        print(f"  {m['id']:<52} ctx {m.get('context_length') or '?':>9}")
+    print("\nfree tiers expire without notice — re-run this before trusting one")
+
+
+# ---------------------------------------------------------------- the proxy
+
+_lock = threading.Lock()
+
+
+def money(x):
+    return f"${x:.4f}" if 0 < x < 0.01 else f"${x:.2f}"
+
+
+def estimate_tokens(body):
+    """~4 chars per token. ponytail: no tokenizer, so pre-flight is an estimate."""
+    text = body.get("prompt") or ""
+    if isinstance(text, list):
+        text = " ".join(str(t) for t in text)
+    for m in body.get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            text += c
+        elif isinstance(c, list):
+            text += "".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return max(1, len(text) // 4) if text else 0
+
+
+def make_handler(wallet, cfg):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _out(self, code, payload, extra=()):
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            for k, v in extra:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _json(self, code, obj):
+            self._out(code, json.dumps(obj).encode())
+
+        def do_GET(self):
+            if self.path.startswith("/__governer"):
+                self._json(200, {"spent": round(wallet.spent, 6), "limit": wallet.limit,
+                                 "remaining": round(wallet.limit - wallet.spent, 6),
+                                 "tripped": wallet.spent >= wallet.limit})
+            else:
+                self._json(404, {"error": {"message": "governer proxies POST only"}})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("content-length") or 0))
+            try:
+                body = json.loads(raw or b"{}")
+            except json.JSONDecodeError:
+                return self._json(400, {"error": {"message": "governer: body is not JSON"}})
+            model = body.get("model") or ""
+            if body.get("stream"):
+                return self._json(400, {"error": {"message":
+                    "governer: stream is not supported yet — send stream:false "
+                    "(the wallet needs the final usage block to bill accurately)"}})
+
+            # 1. worst-case price BEFORE the request leaves the machine
+            est_in = estimate_tokens(body)
+            est_out = int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024)
+            i_rate, o_rate = cfg["rate"](model)
+            estimate = est_in * i_rate + est_out * o_rate
+            with _lock:
+                if wallet.spent + estimate > wallet.limit:
+                    print(f"  🛑 refused {model or '(unnamed)'} est ${estimate:.4f} "
+                          f"— spent ${wallet.spent:.4f} of ${wallet.limit:.2f}")
+                    return self._json(402, {"error": {
+                        "type": "governer_breaker_tripped",
+                        "message": f"governer refused this request: {money(wallet.spent)} spent of "
+                                   f"{money(wallet.limit)} limit, worst case here is ${estimate:.4f}",
+                        "spent": round(wallet.spent, 6), "limit": wallet.limit}})
+
+            # 2. forward, passing the caller's auth through
+            path = self.path
+            up = cfg["upstream"].rstrip("/")
+            if up.endswith("/v1") and path.startswith("/v1"):
+                path = path[3:]  # upstream already carries /v1
+            req = urllib.request.Request(up + path, data=raw, method="POST")
+            for h in ("authorization", "content-type", "x-api-key", "anthropic-version",
+                      "http-referer", "x-title"):
+                v = self.headers.get(h)
+                if v:
+                    req.add_header(h, v)
+            if not self.headers.get("authorization") and cfg.get("key"):
+                req.add_header("authorization", "Bearer " + cfg["key"])
+            try:
+                with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
+                    payload, code = r.read(), r.status
+            except urllib.error.HTTPError as e:
+                payload, code = e.read(), e.code
+            except Exception as e:
+                return self._json(502, {"error": {"message": f"governer: upstream failed: {e}"}})
+
+            # 3. bill what actually happened
+            try:
+                raw_usage = json.loads(payload).get("usage") or {}
+                usage = normalize(raw_usage)
+                if usage:
+                    actual = (usage.get("input", 0) * i_rate + usage.get("output", 0) * o_rate
+                              + usage.get("cache_read", 0) * i_rate * 0.1
+                              + usage.get("cache_write", 0) * i_rate * 1.25)
+                    # the vendor's own number, when it reports one, is an independent check
+                    vendor = raw_usage.get("cost")
+                    if isinstance(vendor, (int, float)) and vendor > 0 \
+                            and abs(vendor - actual) > max(1e-6, actual * 0.02):
+                        print(f"  ⚠ price mismatch: governer ${actual:.6f} vs vendor ${vendor:.6f} "
+                              f"— your prices.json is stale")
+                    with _lock:
+                        try:
+                            wallet.charge(actual, model=model, usage=usage, status=code,
+                                          vendor_cost=vendor)
+                        except Tripped as t:  # estimate was low; that money is already gone
+                            print(f"  ⚠ {t}")
+                    print(f"  ✓ {code} {model:<44} ${actual:.6f}  "
+                          f"${wallet.spent:.4f}/${wallet.limit:.2f}")
+            except Exception as e:
+                print(f"  ⚠ could not price response: {e}")
+
+            self._out(code, payload, [("x-governer-spent", f"{wallet.spent:.6f}"),
+                                      ("x-governer-limit", f"{wallet.limit:.2f}")])
+
+        def log_message(self, *a):
+            pass
+
+    return Handler
+
+
+def cmd_proxy(args):
+    prices = load_prices()
+    wallet = Wallet(args.limit, args.ledger)
+
+    def rate(model):
+        if model in prices:
+            (i, o, _, _), _ = unit_cost(model, prices)
+            return i, o
+        return args.default_in / 1e6, args.default_out / 1e6  # ponytail: unknown = flat rate
+
+    cfg = {"upstream": args.upstream, "rate": rate, "timeout": args.timeout,
+           "key": args.key or os.environ.get("GOVENER_KEY")}
+    srv = ThreadingHTTPServer((args.host, args.port), make_handler(wallet, cfg))
+    base = f"http://{args.host}:{args.port}"
+    print(f"governer {base}  →  {args.upstream}")
+    print(f"wallet ${wallet.limit:.2f} · unknown models billed ${args.default_in}/${args.default_out} per M")
+    if args.ledger:
+        print(f"ledger {args.ledger}")
+    print(f"\n  export OPENAI_BASE_URL={base}/v1")
+    print( "  export OPENAI_API_KEY=<your key>     # governer never stores it")
+    print(f"  curl {base}/__governer\n")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        msg = verify_ledger(args.ledger)[2] if args.ledger else "no ledger"
+        print(f"\nstopped · spent ${wallet.spent:.2f} of ${wallet.limit:.2f} · {msg}")
 
 
 def main(argv=None):
@@ -302,11 +483,30 @@ def main(argv=None):
     c.add_argument("file")
     c.add_argument("--model", default="gpt-6-astra")
     c.add_argument("--limit", type=float)
+    c.add_argument("--fail-over", dest="fail_over", type=float,
+                   help="exit 1 if true cost exceeds this (CI gate)")
     c.set_defaults(fn=cmd_check)
 
     v = sub.add_parser("verify", help="check a ledger for tampering")
     v.add_argument("file")
     v.set_defaults(fn=cmd_verify)
+
+    f = sub.add_parser("free", help="which models are free right now (live)")
+    f.add_argument("--api", default="https://openrouter.ai/api/v1")
+    f.set_defaults(fn=cmd_free)
+
+    x = sub.add_parser("proxy", help="OpenAI-compatible shim that enforces the wallet")
+    x.add_argument("--limit", type=float, default=5.0)
+    x.add_argument("--port", type=int, default=8787)
+    x.add_argument("--host", default="127.0.0.1")
+    x.add_argument("--upstream", default="https://openrouter.ai/api/v1")
+    x.add_argument("--ledger")
+    x.add_argument("--key", help="upstream key, if the client does not send one")
+    x.add_argument("--default-in", dest="default_in", type=float, default=0.0,
+                   help="USD per M for models missing from prices.json (0 = assume free)")
+    x.add_argument("--default-out", dest="default_out", type=float, default=0.0)
+    x.add_argument("--timeout", type=float, default=120)
+    x.set_defaults(fn=cmd_proxy)
 
     args = ap.parse_args(argv)
     args.fn(args)

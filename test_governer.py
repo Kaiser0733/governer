@@ -74,6 +74,77 @@ def test_box_trips():
     assert "paid" in out
 
 
+def test_estimate_tokens():
+    assert g.estimate_tokens({"messages": [{"content": "a" * 400}]}) == 100
+    assert g.estimate_tokens({"messages": [{"content": [{"text": "a" * 40}]}]}) == 10
+
+
+def test_proxy_refuses_before_forwarding():
+    """The upstream here is a dead port: if it were contacted the test would 502."""
+    import threading
+    import urllib.error
+    import urllib.request
+    w = g.Wallet(0.01)
+    cfg = {"upstream": "http://127.0.0.1:1", "rate": lambda m: (10 / 1e6, 50 / 1e6), "timeout": 5}
+    srv = g.ThreadingHTTPServer(("127.0.0.1", 0), g.make_handler(w, cfg))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        body = json.dumps({"model": "x", "max_tokens": 1000,
+                           "messages": [{"content": "hi" * 2000}]}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/v1/chat/completions",
+                                     data=body, method="POST")
+        req.add_header("content-type", "application/json")
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            raise AssertionError("over-budget request was allowed through")
+        except urllib.error.HTTPError as e:
+            assert e.code == 402
+            assert json.loads(e.read())["error"]["type"] == "governer_breaker_tripped"
+        assert w.spent == 0.0, "a refused request must not move money"
+    finally:
+        srv.shutdown()
+
+
+def test_proxy_bills_the_real_usage_block():
+    import threading
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler
+
+    class Upstream(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length") or 0))
+            out = json.dumps({"choices": [{"message": {"content": "ok"}}],
+                              "usage": {"prompt_tokens": 2000, "completion_tokens": 100}}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+
+    up = g.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    w = g.Wallet(1.0)
+    cfg = {"upstream": f"http://127.0.0.1:{up.server_address[1]}",
+           "rate": lambda m: (10 / 1e6, 50 / 1e6), "timeout": 5}
+    srv = g.ThreadingHTTPServer(("127.0.0.1", 0), g.make_handler(w, cfg))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        body = json.dumps({"model": "x", "max_tokens": 50,
+                           "messages": [{"content": "hi"}]}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/v1/chat/completions",
+                                     data=body, method="POST")
+        req.add_header("content-type", "application/json")
+        r = urllib.request.urlopen(req, timeout=5)
+        assert r.status == 200 and r.headers["x-governer-spent"]
+        assert abs(w.spent - (2000 * 10 / 1e6 + 100 * 50 / 1e6)) < 1e-9, w.spent
+    finally:
+        up.shutdown()
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
