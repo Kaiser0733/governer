@@ -3,3 +3,6 @@ __pycache__/
 *.jsonl
 prices.live.json
 usage.json
+build/
+*.egg-info/
+dist/

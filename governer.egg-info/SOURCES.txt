@@ -1,9 +1,0 @@
-LICENSE
-README.md
-governer.py
-pyproject.toml
-governer.egg-info/PKG-INFO
-governer.egg-info/SOURCES.txt
-governer.egg-info/dependency_links.txt
-governer.egg-info/entry_points.txt
-governer.egg-info/top_level.txt
