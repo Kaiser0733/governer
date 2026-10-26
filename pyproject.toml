@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "governer"
-version = "1.0.0"
+version = "1.0.1"
 description = "Hard spend breaker for AI agents — prices cache reads, bills real usage, and refuses the request that would cross your budget."
 readme = "README.md"
 requires-python = ">=3.9"

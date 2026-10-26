@@ -44,8 +44,9 @@ class FakeUpstream:
         self.srv.shutdown()
 
 
-def serve(tr, upstream, dry=False, notify_log=None):
+def serve(tr, upstream, dry=False, notify_log=None, prices=P):
     cfg = {"upstream": upstream, "rate": RATE, "timeout": 5, "dry_run": dry,
+           "prices": prices,
            "alert": (notify_log.append if notify_log is not None else (lambda p: None))}
     srv = g.ThreadingHTTPServer(("127.0.0.1", 0), g.make_handler(tr, cfg))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -73,9 +74,85 @@ def test_cache_read_is_a_tenth():
 
 
 def test_provider_field_spellings_normalize():
-    a = g.normalize({"prompt_tokens": 5, "completion_tokens": 2, "cached_tokens": 1})
-    b = g.normalize({"input_tokens": 5, "output_tokens": 2, "cache_read_input_tokens": 1})
+    a, inc_a = g.normalize({"prompt_tokens": 5, "completion_tokens": 2, "cached_tokens": 1})
+    b, inc_b = g.normalize({"input_tokens": 5, "output_tokens": 2,
+                            "cache_read_input_tokens": 1})
     assert a == b == {"input": 5, "output": 2, "cache_read": 1}
+    assert inc_a is True and inc_b is False, "OpenAI includes cached tokens; Anthropic does not"
+
+
+def test_openai_prompt_tokens_are_not_double_billed():
+    """prompt_tokens already contains the cached ones — charging both is a 5x overbill."""
+    usage = {"input": 1_000_000, "cache_read": 900_000}
+    inclusive = g.cost("m", usage, P, inclusive=True)
+    exclusive = g.cost("m", usage, P, inclusive=False)
+    assert abs(inclusive - 1.9) < 1e-9, inclusive   # 100k fresh @ $10/M + 900k cached @ $1/M
+    assert abs(exclusive - 10.9) < 1e-9, exclusive
+
+
+def test_nested_prompt_tokens_details_are_read():
+    usage, inclusive = g.normalize({"prompt_tokens": 10_000,
+                                    "prompt_tokens_details": {"cached_tokens": 8_000}})
+    assert usage["cache_read"] == 8_000 and inclusive is True
+
+
+def test_cost_uses_the_table_cache_price():
+    table = {"x": {"in": 10.0, "out": 50.0, "cache_read": 2.5}}
+    assert abs(g.cost("x", {"cache_read": 1_000_000}, table) - 2.5) < 1e-9
+
+
+def test_unknown_model_message_is_short():
+    big = {f"model-{i}": {"in": 1.0, "out": 2.0} for i in range(300)}
+    try:
+        g.cost("nope", {"input": 1}, big)
+        raise AssertionError("should have exited")
+    except SystemExit as e:
+        assert len(str(e)) < 400, "the unknown-model error must not dump 300 model names"
+
+
+def test_check_streams_jsonl_and_skips_unpriced():
+    import contextlib
+    import io
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "log.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"model": "claude-opus-5-5", "input_tokens": 1_000_000,
+                                "output_tokens": 0}) + "\n")
+            f.write(json.dumps({"model": "nobody/nothing", "prompt_tokens": 10}) + "\n")
+            f.write(json.dumps({"model": "claude-opus-5-5", "input_tokens": 1_000_000,
+                                "output_tokens": 0}) + "\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            g.main(["check", path])
+        out = buf.getvalue()
+    assert "requests   3" in out, out
+    assert "unpriced   1" in out, out
+    assert "true cost  $8.00" in out, out  # 2 x 1M input at $4/M
+
+
+def test_estimate_counts_tool_schemas():
+    plain = g.estimate_tokens({"messages": [{"content": "hi"}]})
+    with_tools = g.estimate_tokens({"messages": [{"content": "hi"}],
+                                   "tools": [{"name": "x", "parameters": {"a": "b" * 400}}]})
+    assert with_tools > plain + 50
+
+
+def test_bad_content_length_is_rejected_not_a_crash():
+    import http.client
+    up = FakeUpstream()
+    tr = g.Treasury(1.0)
+    srv, url = serve(tr, up.url)
+    try:
+        host, port = url.replace("http://", "").split(":")
+        conn = http.client.HTTPConnection(host, int(port), timeout=5)
+        conn.putrequest("POST", "/v1/chat/completions")
+        conn.putheader("content-length", "banana")
+        conn.endheaders()
+        assert conn.getresponse().status == 400
+        conn.close()
+    finally:
+        srv.shutdown()
+        up.stop()
 
 
 def test_money_shows_small_numbers():

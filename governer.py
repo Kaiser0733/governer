@@ -31,7 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PRICES_PATH = os.environ.get("GOVERNER_PRICES", os.path.join(HERE, "prices.json"))
 LIVE_PATH = os.environ.get("GOVERNER_LIVE", os.path.join(HERE, "prices.live.json"))
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # Provider logs spell the same field three ways. Accept all of them.
 ALIASES = {
@@ -117,7 +117,10 @@ def price_of(model, prices):
     try:
         return prices[model]
     except KeyError:
-        raise SystemExit(f"unknown model: {model}\nknown models: {', '.join(sorted(prices))}")
+        names = sorted(prices)
+        sample = ", ".join(names[:12]) + (" …" if len(names) > 12 else "")
+        raise SystemExit(f"unknown model: {model}\nknown: {sample}\n"
+                         f"`governer prices --refresh` adds the rest")
 
 
 def unit_cost(model, prices):
@@ -133,27 +136,55 @@ def unit_cost(model, prices):
 
 
 def normalize(record):
-    """Map provider field spellings onto our four counters."""
-    out = {}
+    """Map provider field spellings onto our counters.
+
+    Returns (usage, inclusive). `inclusive=True` means the provider already
+    counted cached tokens inside `input` — OpenAI and OpenRouter report
+    prompt_tokens that way, so charging input AND cache_read for the same
+    tokens bills them twice. Anthropic reports cache reads on top of
+    input_tokens, which is exclusive.
+    """
+    out, inclusive = {}, False
     for key, names in ALIASES.items():
         for n in names:
             if n in record:
                 out[key] = record[n]
+                if key == "input" and n == "prompt_tokens":
+                    inclusive = True
                 break
-    return out
+    details = record.get("prompt_tokens_details")
+    if "cache_read" not in out and isinstance(details, dict):
+        for n in ("cached_tokens", "cache_read_tokens"):
+            if isinstance(details.get(n), (int, float)):
+                out["cache_read"] = details[n]
+                break
+    return out, inclusive
 
 
-def cost(model, usage, prices):
-    (i, o, cr, cw), _ = unit_cost(model, prices)
-    return (usage.get("input", 0) * i + usage.get("output", 0) * o
-            + usage.get("cache_read", 0) * cr + usage.get("cache_write", 0) * cw)
+def cost(model, usage, prices, inclusive=False, fallback=None):
+    """USD for one call, using the model's real cache prices when we have them."""
+    if model in prices:
+        (i, o, cr, cw), _ = unit_cost(model, prices)
+    elif fallback:
+        i, o = fallback
+        cr, cw = i * 0.1, i * 1.25  # ponytail: convention only when there is no price row
+    else:
+        price_of(model, prices)  # raises with the unknown-model message
+        return 0.0
+    inp = usage.get("input", 0)
+    cached = usage.get("cache_read", 0)
+    if inclusive:
+        inp = max(0, inp - cached)  # those tokens were already inside input
+    return (inp * i + usage.get("output", 0) * o
+            + cached * cr + usage.get("cache_write", 0) * cw)
 
 
-def sanity(model, usage, prices):
+def sanity(model, usage, prices, inclusive=False):
     """Warnings for what the number might be missing."""
     out, p = [], price_of(model, prices)
     above = p.get("tiered_above")
-    if above and usage.get("input", 0) + usage.get("cache_read", 0) > above:
+    context = usage.get("input", 0) + (0 if inclusive else usage.get("cache_read", 0))
+    if above and context > above:
         out.append(f"above {above:,}-token tier boundary — cost shown is a lower bound")
     if p.get("peak_pricing"):
         out.append("vendor bills peak/off-peak — cost shown assumes peak")
@@ -261,8 +292,12 @@ class Treasury:
             return
         try:
             records = read_ledger(self.total.path)
-        except (OSError, json.JSONDecodeError):
-            return  # an unreadable ledger must not stop the proxy from starting
+        except (OSError, json.JSONDecodeError) as e:
+            # starting is better than not starting, but the caps are now blind —
+            # say so loudly instead of quietly letting spend through
+            print(f"  ⚠ cannot read {self.total.path} ({e}); agent caps start from zero",
+                  file=sys.stderr)
+            return
         for rec in records:
             a = self.agents.get(rec.get("agent"))
             if not a:
@@ -332,8 +367,13 @@ def notify(url, payload, timeout=5):
 def load_config(path):
     if not path:
         return {}
-    with open(path) as f:
-        conf = json.load(f)
+    try:
+        with open(path) as f:
+            conf = json.load(f)
+    except OSError as e:
+        raise SystemExit(f"cannot read config {path}: {e.strerror or e}")
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"{path} is not valid JSON (line {e.lineno}, column {e.colno}): {e.msg}")
     if not isinstance(conf, dict):
         raise SystemExit(f"{path}: config must be a JSON object")
     return conf
@@ -436,29 +476,37 @@ def cmd_box(args):
         print(f"   ledger {args.ledger}: {'OK' if ok else 'BROKEN'} — {msg}")
 
 
-def load_records(path):
-    text = open(path).read().strip()
-    if not text:
-        raise SystemExit(f"{path} is empty")
-    if text[0] == "[":
-        return json.loads(text)
-    try:
-        return [json.loads(text)]
-    except json.JSONDecodeError:
-        return [json.loads(line) for line in text.splitlines() if line.strip()]
+def iter_records(path):
+    """Stream records so a 2GB log does not have to fit in memory."""
+    with open(path) as f:
+        if f.read(1) == "[":
+            f.seek(0)
+            yield from json.load(f)
+            return
+        f.seek(0)
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
 
 
 def cmd_check(args):
     prices = load_prices()
-    records = load_records(args.file)
     wallet = Wallet(args.limit) if args.limit else None
     total, trip_at, waste, misses, warnings = 0.0, None, 0.0, 0, set()
-    for n, rec in enumerate(records, 1):
+    requests = unpriced = 0
+    unknown = set()
+    for rec in iter_records(args.file):
+        requests += 1
         model = rec.get("model") or args.model
-        usage = normalize(rec)
-        c = cost(model, usage, prices)
+        usage, inclusive = normalize(rec)
+        if model not in prices:
+            unpriced += 1
+            unknown.add(model)
+            continue  # an unpriced model must not kill the audit
+        c = cost(model, usage, prices, inclusive)
         total += c
-        warnings.update(sanity(model, usage, prices))
+        warnings.update(sanity(model, usage, prices, inclusive))
         # the silent killer: a big prompt billed with no cache reads at all
         if usage.get("input", 0) >= 10_000 and usage.get("cache_read", 0) == 0:
             misses += 1
@@ -466,11 +514,15 @@ def cmd_check(args):
             waste += usage["input"] * (prices[model]["in"] / 1e6 - cr)
         if wallet and trip_at is None:
             try:
-                wallet.charge(c, request=n, model=model)
+                wallet.charge(c, request=requests, model=model)
             except Tripped:
-                trip_at = (n, wallet.spent)  # spent, not total: the blocked request never billed
-    print(f"requests   {len(records)}")
+                trip_at = (requests, wallet.spent)  # spent, not total: the blocked request never billed
+    print(f"requests   {requests}")
     print(f"true cost  ${total:.2f}")
+    if unpriced:
+        sample = ", ".join(sorted(unknown)[:3])
+        print(f"unpriced   {unpriced} request(s) skipped — {sample}"
+              f"{' …' if len(unknown) > 3 else ''} (run `governer prices --refresh`)")
     if misses:
         print(f"cache miss {misses} request(s) billed uncached while sending ≥10k tokens")
         if total > 0:
@@ -519,17 +571,28 @@ def money(x):
 
 
 def estimate_tokens(body):
-    """~4 chars per token. ponytail: no tokenizer, so pre-flight is an estimate."""
-    text = body.get("prompt") or ""
-    if isinstance(text, list):
-        text = " ".join(str(t) for t in text)
-    for m in body.get("messages") or []:
-        c = m.get("content")
-        if isinstance(c, str):
-            text += c
-        elif isinstance(c, list):
-            text += "".join(p.get("text", "") for p in c if isinstance(p, dict))
-    return max(1, len(text) // 4) if text else 0
+    """~4 chars per token. ponytail: no tokenizer, so pre-flight is an estimate.
+
+    Counts characters instead of building one giant string — a 64MB body used
+    to be copied dozens of times. No tokenizer means governer never spends a
+    token of your budget on counting.
+    """
+    chars = 0
+
+    def count(value):
+        nonlocal chars
+        if isinstance(value, str):
+            chars += len(value)
+        elif isinstance(value, list):
+            for item in value:
+                count(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                count(item)
+
+    for key in ("messages", "system", "prompt", "tools"):
+        count(body.get(key))
+    return max(1, chars // 4) if chars else 0
 
 
 def make_handler(tr, cfg):
@@ -555,14 +618,20 @@ def make_handler(tr, cfg):
                 self._json(404, {"error": {"message": "governer proxies POST only"}})
 
         def do_POST(self):
-            length = int(self.headers.get("content-length") or 0)
+            try:
+                length = int(self.headers.get("content-length") or 0)
+            except ValueError:
+                return self._json(400, {"error": {"message":
+                                                  "governer: content-length is not a number"}})
             if length > 64 * 1024 * 1024:
                 return self._json(413, {"error": {"message": "governer: body over 64MB"}})
             raw = self.rfile.read(length)
             try:
                 body = json.loads(raw or b"{}")
             except (json.JSONDecodeError, UnicodeDecodeError):
-                return self._json(400, {"error": {"message": "governer: body is not JSON"}})
+                return self._json(400, {"error": {"message":
+                    "governer: body is not JSON (chunked uploads without a "
+                    "content-length are not supported)"}})
             if not isinstance(body, dict):
                 return self._json(400, {"error": {"message":
                                                   "governer: body must be a JSON object"}})
@@ -575,7 +644,10 @@ def make_handler(tr, cfg):
 
             # 1. worst-case price BEFORE the request leaves the machine
             est_in = estimate_tokens(body)
-            est_out = int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024)
+            try:
+                est_out = int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024)
+            except (TypeError, ValueError):
+                est_out = 1024
             i_rate, o_rate = cfg["rate"](model)
             estimate = est_in * i_rate + est_out * o_rate
             with _lock:
@@ -616,17 +688,15 @@ def make_handler(tr, cfg):
             # 3. bill what actually happened
             try:
                 raw_usage = json.loads(payload).get("usage") or {}
-                usage = normalize(raw_usage)
+                usage, inclusive = normalize(raw_usage)
                 if usage:
-                    actual = (usage.get("input", 0) * i_rate + usage.get("output", 0) * o_rate
-                              + usage.get("cache_read", 0) * i_rate * 0.1
-                              + usage.get("cache_write", 0) * i_rate * 1.25)
-                    # the vendor's own number, when it reports one, is an independent check
+                    actual = cost(model, usage, cfg.get("prices") or {}, inclusive,
+                                  fallback=(i_rate, o_rate))
                     vendor = raw_usage.get("cost")
                     if isinstance(vendor, (int, float)) and vendor > 0 \
                             and abs(vendor - actual) > max(1e-6, actual * 0.02):
                         print(f"  ⚠ price mismatch: governer ${actual:.6f} vs vendor ${vendor:.6f} "
-                              f"— your prices.json is stale")
+                              f"— prices.json is stale for {model}")
                     with _lock:
                         why = tr.blocker(agent, actual)
                         if why and cfg["dry_run"]:
@@ -679,7 +749,7 @@ def cmd_proxy(args):
             notify(webhook, payload)
 
     cfg = {"upstream": upstream, "rate": rate, "timeout": args.timeout,
-           "dry_run": dry, "alert": alert,
+           "prices": prices, "dry_run": dry, "alert": alert,
            "key": args.key or os.environ.get("GOVENER_KEY")}
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(tr, cfg))
     base = f"http://{args.host}:{args.port}"

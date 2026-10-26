@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.1 — 2026-10-26
+
+Billing correctness. Found by auditing the money path line by line, not by a report.
+
+- **OpenAI and OpenRouter were double-billed.** `prompt_tokens` already contains
+  the cached tokens, so charging `input` *and* `cache_read` billed the same tokens
+  twice — up to 10× over on a cache-heavy call. Records from `prompt_tokens` are
+  now treated as inclusive; Anthropic's `input_tokens` stays exclusive.
+- **Nested cache counters are read.** `prompt_tokens_details.cached_tokens` was
+  ignored entirely, so cached traffic looked like full-price input.
+- **The proxy used hardcoded cache rates (0.1× / 1.25×)** instead of the model's
+  real cache price from the table. It now uses the table.
+- **The pre-flight estimate copied the whole request into one string**, which on a
+  64MB body is gigabytes of churn. It now counts characters.
+- **An unpriced model in a log killed the whole audit.** It is now skipped and
+  reported as a count.
+- **Logs are streamed**, so auditing a 2GB file does not need 2GB of RAM.
+- **Malformed `content-length` and `max_tokens` return 400** instead of a traceback.
+- An unreadable ledger now warns on stderr instead of silently starting every cap at zero.
+- The unknown-model error lists 12 examples, not all 472.
+
 ## 1.0.0 — 2026-10-26
 
 First release that can be trusted in front of an unattended agent.
