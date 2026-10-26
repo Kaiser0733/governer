@@ -1,0 +1,14 @@
+{
+  "limit": 20.0,
+  "upstream": "https://openrouter.ai/api/v1",
+  "ledger": "spend.jsonl",
+  "default_in": 0,
+  "default_out": 0,
+  "dry_run": false,
+  "notify": "",
+  "agents": {
+    "claude-code": { "limit": 5.0, "per": "day" },
+    "codex": { "limit": 5.0, "per": "day" },
+    "ci": { "limit": 2.0, "per": "run" }
+  }
+}

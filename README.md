@@ -152,4 +152,6 @@ and open a PR when a vendor moves.
 
 ## License
 
+**Docs and demo:** https://kaiser0733.github.io/governer/
+
 MIT. Built by [Kaiser0733](https://github.com/Kaiser0733) at Vastraa Labs.

@@ -31,6 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PRICES_PATH = os.environ.get("GOVERNER_PRICES", os.path.join(HERE, "prices.json"))
 LIVE_PATH = os.environ.get("GOVERNER_LIVE", os.path.join(HERE, "prices.live.json"))
 
+__version__ = "1.0.0"
+
 # Provider logs spell the same field three ways. Accept all of them.
 ALIASES = {
     "input": ("input", "input_tokens", "prompt_tokens"),
@@ -40,9 +42,32 @@ ALIASES = {
 }
 
 
+# Installed copies (pipx, site-packages) have no prices.json next to the module,
+# so the tool still works out of the box. Keep in sync with prices.json —
+# test_embedded_prices_match_the_file fails the moment these drift.
+_FALLBACK = {
+    "claude-fable-5-1": {"in": 10.0, "out": 50.0},
+    "claude-opus-5-5": {"in": 4.0, "out": 20.0},
+    "claude-sonnet-5-5": {"in": 2.0, "out": 10.0},
+    "claude-haiku-5-5": {"in": 0.10, "out": 0.50},
+    "gpt-6-astra": {"in": 10.0, "out": 50.0},
+    "gpt-6-1-sol": {"in": 2.0, "out": 10.0},
+    "gpt-6-luna": {"in": 0.10, "out": 0.50},
+    "gemini-3-8-flash": {"in": 0.75, "out": 3.75},
+    "gemini-4-argon": {"in": 2.0, "out": 10.0},
+    "grok-4-7": {"in": 2.0, "out": 6.0, "tiered_above": 200000},
+    "deepseek-v4-pro": {"in": 1.32, "out": 3.96, "peak_pricing": True},
+    "qwen3-5-plus": {"in": 0.40, "out": 2.40, "tiered_above": 256000},
+    "llama-5-hosted": {"in": 0.35, "out": 0.35},
+}
+
+
 def load_curated(path=PRICES_PATH):
-    with open(path) as f:
-        return json.load(f)["models"]
+    try:
+        with open(path) as f:
+            return json.load(f)["models"]
+    except OSError:
+        return dict(_FALLBACK)
 
 
 def load_prices(path=PRICES_PATH):
@@ -138,11 +163,13 @@ def sanity(model, usage, prices):
 # ---------------------------------------------------------------- the breaker
 
 class Tripped(Exception):
-    def __init__(self, spent, limit, would_be):
+    def __init__(self, spent, limit, would_be, reason=""):
         self.spent, self.limit, self.would_be = spent, limit, would_be
+        self.reason = reason
         super().__init__(
-            f"tripped at ${spent:.2f} of ${limit:.2f}; "
-            f"request blocked (would have cost ${would_be - spent:.4f})")
+            f"tripped at ${spent:.4f} of ${limit:.2f}; "
+            f"request blocked (would have cost ${would_be - spent:.4f})"
+            + (f" — {reason}" if reason else ""))
 
 
 def _hash(rec):
@@ -170,6 +197,10 @@ class Wallet:
     def charge(self, amount, **meta):
         if self.spent + amount > self.limit:
             raise Tripped(self.spent, self.limit, self.spent + amount)
+        return self.record(amount, **meta)
+
+    def record(self, amount, **meta):
+        """Book spend that already happened, even past the limit. Reporting only."""
         self.spent += amount
         rec = {"ts": now(), "cost": round(amount, 8), "total": round(self.spent, 8),
                "prev": self.prev, **meta}
@@ -178,6 +209,8 @@ class Wallet:
         if self.path:
             with open(self.path, "a") as f:
                 f.write(json.dumps(rec, sort_keys=True) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
         return rec
 
 
@@ -195,6 +228,115 @@ def verify_ledger(path):
             return False, n, f"record {n + 1} was edited after it was written"
         prev, n, total = rec["hash"], n + 1, total + rec.get("cost", 0)
     return True, n, f"{n} records · ${total:.4f} · chain intact"
+
+
+class Treasury:
+    """One total budget plus per-agent caps, all checked before a request leaves.
+
+    Agents are identified by the `X-Governer-Agent` header. A cap with
+    `"per": "day"` resets at UTC midnight; `"per": "run"` lasts for the process
+    and survives a restart by re-reading today's ledger records.
+    """
+
+    def __init__(self, limit, path=None, agents=None):
+        self.total = Wallet(limit, path)
+        self.agents = {name: {"limit": float(cfg.get("limit", 0)),
+                              "spent": 0.0,
+                              "per": cfg.get("per", "run")}
+                       for name, cfg in (agents or {}).items()}
+        self.today = now()[:10]
+        self._rehydrate()
+
+    @property
+    def spent(self):
+        return self.total.spent
+
+    @property
+    def limit(self):
+        return self.total.limit
+
+    def _rehydrate(self):
+        """Rebuild per-agent counters from the ledger so restarts cannot reset a cap."""
+        if not self.total.path or not os.path.exists(self.total.path):
+            return
+        try:
+            records = read_ledger(self.total.path)
+        except (OSError, json.JSONDecodeError):
+            return  # an unreadable ledger must not stop the proxy from starting
+        for rec in records:
+            a = self.agents.get(rec.get("agent"))
+            if not a:
+                continue
+            if a["per"] == "run" or str(rec.get("ts", ""))[:10] == self.today:
+                a["spent"] += rec.get("cost", 0)
+
+    def _roll_day(self):
+        today = now()[:10]
+        if today != self.today:
+            self.today = today
+            for a in self.agents.values():
+                if a["per"] == "day":
+                    a["spent"] = 0.0
+
+    def blocker(self, agent, amount):
+        """Why this charge would be refused, or None. Read-only."""
+        if self.total.spent + amount > self.total.limit:
+            return f"total budget {money(self.total.spent)} of {money(self.total.limit)}"
+        a = self.agents.get(agent)
+        if a and a["limit"] > 0 and a["spent"] + amount > a["limit"]:
+            return f"agent '{agent}' {money(a['spent'])} of {money(a['limit'])} per {a['per']}"
+        return None
+
+    def charge(self, agent, amount, **meta):
+        self._roll_day()
+        why = self.blocker(agent, amount)
+        if why:
+            raise Tripped(self.total.spent, self.total.limit,
+                          self.total.spent + amount, why)
+        return self._book(agent, amount, meta)
+
+    def force_charge(self, agent, amount, **meta):
+        """Book spend that already left the account, or a dry-run overrun."""
+        self._roll_day()
+        return self._book(agent, amount, meta)
+
+    def _book(self, agent, amount, meta):
+        rec = self.total.record(amount, agent=agent, **meta)
+        if agent in self.agents:
+            self.agents[agent]["spent"] += amount
+        return rec
+
+    def status(self):
+        return {"version": __version__,
+                "spent": round(self.spent, 6), "limit": self.limit,
+                "remaining": round(self.limit - self.spent, 6),
+                "tripped": self.spent >= self.limit,
+                "agents": {name: {"spent": round(a["spent"], 6),
+                                  "limit": a["limit"], "per": a["per"]}
+                           for name, a in self.agents.items()}}
+
+
+def notify(url, payload, timeout=5):
+    """Fire-and-forget webhook. A broken webhook must never break the breaker."""
+    def send():
+        try:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+            req.add_header("content-type", "application/json")
+            urllib.request.urlopen(req, timeout=timeout).read()
+        except Exception:
+            pass
+
+    threading.Thread(target=send, daemon=True).start()
+
+
+def load_config(path):
+    if not path:
+        return {}
+    with open(path) as f:
+        conf = json.load(f)
+    if not isinstance(conf, dict):
+        raise SystemExit(f"{path}: config must be a JSON object")
+    return conf
 
 
 # ---------------------------------------------------------------- commands
@@ -390,7 +532,7 @@ def estimate_tokens(body):
     return max(1, len(text) // 4) if text else 0
 
 
-def make_handler(wallet, cfg):
+def make_handler(tr, cfg):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -408,19 +550,24 @@ def make_handler(wallet, cfg):
 
         def do_GET(self):
             if self.path.startswith("/__governer"):
-                self._json(200, {"spent": round(wallet.spent, 6), "limit": wallet.limit,
-                                 "remaining": round(wallet.limit - wallet.spent, 6),
-                                 "tripped": wallet.spent >= wallet.limit})
+                self._json(200, tr.status())
             else:
                 self._json(404, {"error": {"message": "governer proxies POST only"}})
 
         def do_POST(self):
-            raw = self.rfile.read(int(self.headers.get("content-length") or 0))
+            length = int(self.headers.get("content-length") or 0)
+            if length > 64 * 1024 * 1024:
+                return self._json(413, {"error": {"message": "governer: body over 64MB"}})
+            raw = self.rfile.read(length)
             try:
                 body = json.loads(raw or b"{}")
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return self._json(400, {"error": {"message": "governer: body is not JSON"}})
+            if not isinstance(body, dict):
+                return self._json(400, {"error": {"message":
+                                                  "governer: body must be a JSON object"}})
             model = body.get("model") or ""
+            agent = (self.headers.get("x-governer-agent") or "default")[:64]
             if body.get("stream"):
                 return self._json(400, {"error": {"message":
                     "governer: stream is not supported yet — send stream:false "
@@ -432,14 +579,18 @@ def make_handler(wallet, cfg):
             i_rate, o_rate = cfg["rate"](model)
             estimate = est_in * i_rate + est_out * o_rate
             with _lock:
-                if wallet.spent + estimate > wallet.limit:
-                    print(f"  🛑 refused {model or '(unnamed)'} est ${estimate:.4f} "
-                          f"— spent ${wallet.spent:.4f} of ${wallet.limit:.2f}")
-                    return self._json(402, {"error": {
-                        "type": "governer_breaker_tripped",
-                        "message": f"governer refused this request: {money(wallet.spent)} spent of "
-                                   f"{money(wallet.limit)} limit, worst case here is ${estimate:.4f}",
-                        "spent": round(wallet.spent, 6), "limit": wallet.limit}})
+                why = tr.blocker(agent, estimate)
+            if why and cfg["dry_run"]:
+                print(f"  ◌ would refuse {agent}/{model or '(unnamed)'} — {why}")
+            elif why:
+                print(f"  🛑 refused {agent}/{model or '(unnamed)'} — {why}")
+                cfg["alert"]({"event": "breaker_tripped", "agent": agent, "model": model,
+                              "reason": why, "estimate": round(estimate, 6), **tr.status()})
+                return self._json(402, {"error": {
+                    "type": "governer_breaker_tripped",
+                    "message": f"governer refused this request: {why}; "
+                               f"worst case here is ${estimate:.4f}",
+                    "agent": agent, "spent": round(tr.spent, 6), "limit": tr.limit}})
 
             # 2. forward, passing the caller's auth through
             path = self.path
@@ -477,18 +628,28 @@ def make_handler(wallet, cfg):
                         print(f"  ⚠ price mismatch: governer ${actual:.6f} vs vendor ${vendor:.6f} "
                               f"— your prices.json is stale")
                     with _lock:
-                        try:
-                            wallet.charge(actual, model=model, usage=usage, status=code,
-                                          vendor_cost=vendor)
-                        except Tripped as t:  # estimate was low; that money is already gone
-                            print(f"  ⚠ {t}")
-                    print(f"  ✓ {code} {model:<44} ${actual:.6f}  "
-                          f"${wallet.spent:.4f}/${wallet.limit:.2f}")
+                        why = tr.blocker(agent, actual)
+                        if why and cfg["dry_run"]:
+                            print(f"  ◌ would overrun — {why}")
+                            tr.force_charge(agent, actual, model=model, usage=usage,
+                                            status=code, vendor_cost=vendor, dry_run=True)
+                        elif why:  # the estimate was low and the money is already gone
+                            print(f"  ⚠ estimate was low — {why}")
+                            tr.force_charge(agent, actual, model=model, usage=usage,
+                                            status=code, vendor_cost=vendor)
+                            cfg["alert"]({"event": "overrun", "agent": agent, "model": model,
+                                          "reason": why, **tr.status()})
+                        else:
+                            tr.charge(agent, actual, model=model, usage=usage,
+                                      status=code, vendor_cost=vendor)
+                    print(f"  ✓ {code} {agent}/{model[:34]:<34} ${actual:.6f}  "
+                          f"${tr.spent:.4f}/${tr.limit:.2f}")
             except Exception as e:
                 print(f"  ⚠ could not price response: {e}")
 
-            self._out(code, payload, [("x-governer-spent", f"{wallet.spent:.6f}"),
-                                      ("x-governer-limit", f"{wallet.limit:.2f}")])
+            self._out(code, payload, [("x-governer-spent", f"{tr.spent:.6f}"),
+                                      ("x-governer-limit", f"{tr.limit:.2f}"),
+                                      ("x-governer-agent", agent)])
 
         def log_message(self, *a):
             pass
@@ -497,36 +658,55 @@ def make_handler(wallet, cfg):
 
 
 def cmd_proxy(args):
+    conf = load_config(args.config)
+    limit = args.limit if args.limit is not None else conf.get("limit", 5.0)
+    upstream = args.upstream or conf.get("upstream") or "https://openrouter.ai/api/v1"
+    ledger = args.ledger or conf.get("ledger")
+    d_in = args.default_in if args.default_in is not None else conf.get("default_in", 0.0)
+    d_out = args.default_out if args.default_out is not None else conf.get("default_out", 0.0)
+    dry = bool(args.dry_run or conf.get("dry_run"))
+    webhook = args.notify or conf.get("notify")
     prices = load_prices()
-    wallet = Wallet(args.limit, args.ledger)
+    tr = Treasury(limit, ledger, conf.get("agents") or {})
 
     def rate(model):
         if model in prices:
             (i, o, _, _), _ = unit_cost(model, prices)
             return i, o
-        return args.default_in / 1e6, args.default_out / 1e6  # ponytail: unknown = flat rate
+        return d_in / 1e6, d_out / 1e6  # ponytail: unknown model = flat rate
+    def alert(payload):
+        if webhook:
+            notify(webhook, payload)
 
-    cfg = {"upstream": args.upstream, "rate": rate, "timeout": args.timeout,
+    cfg = {"upstream": upstream, "rate": rate, "timeout": args.timeout,
+           "dry_run": dry, "alert": alert,
            "key": args.key or os.environ.get("GOVENER_KEY")}
-    srv = ThreadingHTTPServer((args.host, args.port), make_handler(wallet, cfg))
+    srv = ThreadingHTTPServer((args.host, args.port), make_handler(tr, cfg))
     base = f"http://{args.host}:{args.port}"
-    print(f"governer {base}  →  {args.upstream}")
-    print(f"wallet ${wallet.limit:.2f} · unknown models billed ${args.default_in}/${args.default_out} per M")
-    if args.ledger:
-        print(f"ledger {args.ledger}")
+    print(f"governer {__version__}  {base}  →  {upstream}")
+    print(f"budget {money(tr.limit)}"
+          f"{'  (dry run: counts, never refuses)' if dry else ''}"
+          f" · unknown models ${d_in}/${d_out} per M")
+    for name, a in tr.agents.items():
+        print(f"  agent {name:<22} {money(a['limit'])} per {a['per']}")
+    if ledger:
+        print(f"ledger {ledger}")
+    if webhook:
+        print(f"alerts {webhook}")
     print(f"\n  export OPENAI_BASE_URL={base}/v1")
     print( "  export OPENAI_API_KEY=<your key>     # governer never stores it")
     print(f"  curl {base}/__governer\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        msg = verify_ledger(args.ledger)[2] if args.ledger else "no ledger"
-        print(f"\nstopped · spent ${wallet.spent:.2f} of ${wallet.limit:.2f} · {msg}")
+        msg = verify_ledger(ledger)[2] if ledger else "no ledger"
+        print(f"\nstopped · spent {money(tr.spent)} of {money(tr.limit)} · {msg}")
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="governer", description="hard spend governor for AI agents")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--version", action="version", version=f"governer {__version__}")
+    sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("prices", help="what models cost right now")
     p.add_argument("--upcoming", action="store_true", help="announced price changes only")
@@ -564,19 +744,26 @@ def main(argv=None):
     f.set_defaults(fn=cmd_free)
 
     x = sub.add_parser("proxy", help="OpenAI-compatible shim that enforces the wallet")
-    x.add_argument("--limit", type=float, default=5.0)
+    x.add_argument("--config", help="JSON config: limit, upstream, ledger, agents, notify, dry_run")
+    x.add_argument("--limit", type=float)
     x.add_argument("--port", type=int, default=8787)
     x.add_argument("--host", default="127.0.0.1")
-    x.add_argument("--upstream", default="https://openrouter.ai/api/v1")
+    x.add_argument("--upstream")
     x.add_argument("--ledger")
+    x.add_argument("--notify", help="webhook URL to POST to when the breaker trips")
+    x.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="count everything, refuse nothing (watch before you enforce)")
     x.add_argument("--key", help="upstream key, if the client does not send one")
-    x.add_argument("--default-in", dest="default_in", type=float, default=0.0,
-                   help="USD per M for models missing from prices.json (0 = assume free)")
-    x.add_argument("--default-out", dest="default_out", type=float, default=0.0)
+    x.add_argument("--default-in", dest="default_in", type=float,
+                   help="USD per M for models missing from the price tables (0 = assume free)")
+    x.add_argument("--default-out", dest="default_out", type=float)
     x.add_argument("--timeout", type=float, default=120)
     x.set_defaults(fn=cmd_proxy)
 
     args = ap.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        ap.print_help()
+        sys.exit(2)
     args.fn(args)
 
 
