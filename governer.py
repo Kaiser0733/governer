@@ -31,7 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PRICES_PATH = os.environ.get("GOVERNER_PRICES", os.path.join(HERE, "prices.json"))
 LIVE_PATH = os.environ.get("GOVERNER_LIVE", os.path.join(HERE, "prices.live.json"))
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 # Provider logs spell the same field three ways. Accept all of them.
 ALIASES = {
@@ -276,6 +276,8 @@ class Treasury:
                               "per": cfg.get("per", "run")}
                        for name, cfg in (agents or {}).items()}
         self.today = now()[:10]
+        self.held = 0.0            # estimates currently in flight, not yet billed
+        self.agent_held = {}
         self._rehydrate()
 
     @property
@@ -314,13 +316,31 @@ class Treasury:
                     a["spent"] = 0.0
 
     def blocker(self, agent, amount):
-        """Why this charge would be refused, or None. Read-only."""
-        if self.total.spent + amount > self.total.limit:
-            return f"total budget {money(self.total.spent)} of {money(self.total.limit)}"
+        """Why this charge would be refused, or None. Counts in-flight holds."""
+        if self.total.spent + self.held + amount > self.total.limit:
+            flight = f" ({money(self.held)} in flight)" if self.held else ""
+            return (f"total budget {money(self.total.spent)} of "
+                    f"{money(self.total.limit)}{flight}")
         a = self.agents.get(agent)
-        if a and a["limit"] > 0 and a["spent"] + amount > a["limit"]:
+        if a and a["limit"] > 0 and \
+                a["spent"] + self.agent_held.get(agent, 0.0) + amount > a["limit"]:
             return f"agent '{agent}' {money(a['spent'])} of {money(a['limit'])} per {a['per']}"
         return None
+
+    def reserve(self, agent, amount):
+        """Hold an estimate. Ten concurrent requests must not each see the same budget."""
+        self._roll_day()
+        why = self.blocker(agent, amount)
+        if why:
+            raise Tripped(self.total.spent, self.total.limit,
+                          self.total.spent + amount, why)
+        self.held += amount
+        self.agent_held[agent] = self.agent_held.get(agent, 0.0) + amount
+
+    def release(self, agent, amount):
+        self.held = max(0.0, self.held - amount)
+        if agent in self.agent_held:
+            self.agent_held[agent] = max(0.0, self.agent_held[agent] - amount)
 
     def charge(self, agent, amount, **meta):
         self._roll_day()
@@ -542,6 +562,43 @@ def cmd_check(args):
         sys.exit(1)
 
 
+def cmd_status(args):
+    """The meter. A hard cap alone just moves spend to the last week of the month."""
+    records = read_ledger(args.file)
+    if not records:
+        print(f"{args.file} is empty — nothing spent yet")
+        return
+    total = sum(r.get("cost", 0) for r in records)
+    by_agent = {}
+    for r in records:
+        name = r.get("agent") or "unknown"
+        by_agent[name] = by_agent.get(name, 0.0) + r.get("cost", 0)
+    print(f"spent      {money(total)}"
+          + (f" of {money(args.limit)}  ({total / args.limit * 100:.0f}% used)"
+             if args.limit else ""))
+    try:
+        first = datetime.fromisoformat(records[0]["ts"])
+        last = datetime.fromisoformat(records[-1]["ts"])
+        hours = max((last - first).total_seconds() / 3600, 1 / 60)
+    except (KeyError, ValueError):
+        hours = None
+    if hours is not None and hours < 0.5:
+        # a handful of records in the same minute extrapolates to nonsense; say so
+        print(f"burn rate  needs a longer window — this ledger spans {hours * 60:.0f}m")
+    elif hours and total > 0:
+        rate = total / hours
+        print(f"burn rate  {money(rate)}/h over {hours:.1f}h")
+        print(f"projected  {money(rate * 24)}/day at this rate")
+        if args.limit:
+            left = args.limit - total
+            print(f"runs out   in {left / rate:.1f}h at this rate" if left > 0
+                  else "runs out   already over the line")
+    for name, amount in sorted(by_agent.items(), key=lambda kv: -kv[1]):
+        print(f"agent      {name:<22} {money(amount)}")
+    ok, _, msg = verify_ledger(args.file)
+    print(f"chain      {'OK' if ok else 'BROKEN'} — {msg}")
+
+
 def cmd_verify(args):
     ok, n, msg = verify_ledger(args.file)
     print(f"{'OK' if ok else 'BROKEN'} — {msg}")
@@ -617,6 +674,70 @@ def make_handler(tr, cfg):
             else:
                 self._json(404, {"error": {"message": "governer proxies POST only"}})
 
+        def _relay_stream(self, resp, tr, agent):
+            """Pass the provider's SSE straight through, remembering the usage block."""
+            self.send_response(resp.status)
+            self.send_header("content-type",
+                             resp.headers.get("content-type", "text/event-stream"))
+            self.send_header("transfer-encoding", "chunked")
+            self.send_header("x-governer-spent", f"{tr.spent:.6f}")
+            self.send_header("x-governer-limit", f"{tr.limit:.2f}")
+            self.send_header("x-governer-agent", agent)
+            self.end_headers()
+            usage = {}
+            try:
+                for line in resp:
+                    self.wfile.write(b"%X\r\n" % len(line) + line + b"\r\n")
+                    text = line.strip()
+                    if text.startswith(b"data:"):
+                        chunk = text[5:].strip()
+                        if chunk and chunk != b"[DONE]":
+                            try:
+                                obj = json.loads(chunk)
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                continue
+                            if isinstance(obj, dict) and obj.get("usage"):
+                                usage = obj["usage"]
+            finally:
+                resp.close()
+                self.wfile.write(b"0\r\n\r\n")
+            return usage
+
+        def _bill(self, agent, model, raw_usage, code, i_rate, o_rate, estimate, held):
+            """Release the hold, then book what really happened."""
+            usage, inclusive = normalize(raw_usage)
+            with _lock:
+                if held:
+                    tr.release(agent, estimate)
+                if not usage:  # no usage block: assume the estimate rather than zero
+                    tr.force_charge(agent, estimate, model=model, status=code, assumed=True)
+                    print(f"  ⚠ no usage block from provider — booked the ${estimate:.4f} estimate")
+                    return
+            actual = cost(model, usage, cfg.get("prices") or {}, inclusive,
+                          fallback=(i_rate, o_rate))
+            vendor = raw_usage.get("cost")
+            if isinstance(vendor, (int, float)) and vendor > 0 \
+                    and abs(vendor - actual) > max(1e-6, actual * 0.02):
+                print(f"  ⚠ price mismatch: governer ${actual:.6f} vs vendor ${vendor:.6f} "
+                      f"— prices.json is stale for {model}")
+            with _lock:
+                why = tr.blocker(agent, actual)
+                if why and cfg["dry_run"]:
+                    print(f"  ◌ would overrun — {why}")
+                    tr.force_charge(agent, actual, model=model, usage=usage, status=code,
+                                    vendor_cost=vendor, dry_run=True)
+                elif why:  # the estimate was low and the money is already gone
+                    print(f"  ⚠ estimate was low — {why}")
+                    tr.force_charge(agent, actual, model=model, usage=usage, status=code,
+                                    vendor_cost=vendor)
+                    cfg["alert"]({"event": "overrun", "agent": agent, "model": model,
+                                  "reason": why, **tr.status()})
+                else:
+                    tr.charge(agent, actual, model=model, usage=usage, status=code,
+                              vendor_cost=vendor)
+            print(f"  ✓ {code} {agent}/{model[:34]:<34} ${actual:.6f}  "
+                  f"${tr.spent:.4f}/${tr.limit:.2f}")
+
         def do_POST(self):
             try:
                 length = int(self.headers.get("content-length") or 0)
@@ -637,12 +758,19 @@ def make_handler(tr, cfg):
                                                   "governer: body must be a JSON object"}})
             model = body.get("model") or ""
             agent = (self.headers.get("x-governer-agent") or "default")[:64]
-            if body.get("stream"):
-                return self._json(400, {"error": {"message":
-                    "governer: stream is not supported yet — send stream:false "
-                    "(the wallet needs the final usage block to bill accurately)"}})
+            prices = cfg.get("prices") or {}
 
-            # 1. worst-case price BEFORE the request leaves the machine
+            if model not in prices:
+                warned = cfg.setdefault("warned", set())
+                if model not in warned:
+                    warned.add(model)
+                    i_r, o_r = cfg["rate"](model)
+                    print(f"  ⚠ {model or '(no model)'} has no price row — billed at "
+                          f"${i_r * 1e6:g}/${o_r * 1e6:g} per M. `governer prices --refresh` "
+                          f"fixes that")
+
+            # 1. hold the worst case BEFORE the request leaves the machine, so parallel
+            #    requests cannot each be shown the same remaining budget
             est_in = estimate_tokens(body)
             try:
                 est_out = int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024)
@@ -650,19 +778,31 @@ def make_handler(tr, cfg):
                 est_out = 1024
             i_rate, o_rate = cfg["rate"](model)
             estimate = est_in * i_rate + est_out * o_rate
+            held = False
             with _lock:
                 why = tr.blocker(agent, estimate)
-            if why and cfg["dry_run"]:
-                print(f"  ◌ would refuse {agent}/{model or '(unnamed)'} — {why}")
-            elif why:
-                print(f"  🛑 refused {agent}/{model or '(unnamed)'} — {why}")
-                cfg["alert"]({"event": "breaker_tripped", "agent": agent, "model": model,
-                              "reason": why, "estimate": round(estimate, 6), **tr.status()})
-                return self._json(402, {"error": {
-                    "type": "governer_breaker_tripped",
-                    "message": f"governer refused this request: {why}; "
-                               f"worst case here is ${estimate:.4f}",
-                    "agent": agent, "spent": round(tr.spent, 6), "limit": tr.limit}})
+                if why is None:
+                    tr.reserve(agent, estimate)
+                    held = True
+            if why:
+                if cfg["dry_run"]:
+                    print(f"  ◌ would refuse {agent}/{model or '(unnamed)'} — {why}")
+                else:
+                    print(f"  🛑 refused {agent}/{model or '(unnamed)'} — {why}")
+                    cfg["alert"]({"event": "breaker_tripped", "agent": agent, "model": model,
+                                  "reason": why, "estimate": round(estimate, 6), **tr.status()})
+                    return self._json(402, {"error": {
+                        "type": "governer_breaker_tripped",
+                        "message": f"governer refused this request: {why}; "
+                                   f"worst case here is ${estimate:.4f}",
+                        "agent": agent, "spent": round(tr.spent, 6), "limit": tr.limit}})
+
+            stream = bool(body.get("stream"))
+            if stream:  # without this, most providers never send the usage block
+                opts = dict(body.get("stream_options") or {})
+                opts["include_usage"] = True
+                body["stream_options"] = opts
+                raw = json.dumps(body).encode()
 
             # 2. forward, passing the caller's auth through
             path = self.path
@@ -678,45 +818,38 @@ def make_handler(tr, cfg):
             if not self.headers.get("authorization") and cfg.get("key"):
                 req.add_header("authorization", "Bearer " + cfg["key"])
             try:
-                with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
-                    payload, code = r.read(), r.status
+                resp = urllib.request.urlopen(req, timeout=cfg["timeout"])
             except urllib.error.HTTPError as e:
-                payload, code = e.read(), e.code
+                payload, code, resp = e.read(), e.code, None
             except Exception as e:
+                if held:
+                    with _lock:
+                        tr.release(agent, estimate)
+                if "timed out" in str(e).lower() or "reset" in str(e).lower():
+                    # the provider may have run and billed it: assume the money is gone
+                    with _lock:
+                        tr.force_charge(agent, estimate, model=model, assumed=True,
+                                        note=f"upstream {type(e).__name__}")
+                    print(f"  ⚠ upstream {type(e).__name__} — booked the ${estimate:.4f} estimate")
                 return self._json(502, {"error": {"message": f"governer: upstream failed: {e}"}})
+
+            if stream and resp is not None and resp.status < 400:
+                raw_usage = self._relay_stream(resp, tr, agent)
+                self._bill(agent, model, raw_usage, resp.status, i_rate, o_rate, estimate, held)
+                return
+
+            try:
+                payload, code = (resp.read(), resp.status) if resp is not None else (payload, code)
+            finally:
+                if resp is not None:
+                    resp.close()
 
             # 3. bill what actually happened
             try:
                 raw_usage = json.loads(payload).get("usage") or {}
-                usage, inclusive = normalize(raw_usage)
-                if usage:
-                    actual = cost(model, usage, cfg.get("prices") or {}, inclusive,
-                                  fallback=(i_rate, o_rate))
-                    vendor = raw_usage.get("cost")
-                    if isinstance(vendor, (int, float)) and vendor > 0 \
-                            and abs(vendor - actual) > max(1e-6, actual * 0.02):
-                        print(f"  ⚠ price mismatch: governer ${actual:.6f} vs vendor ${vendor:.6f} "
-                              f"— prices.json is stale for {model}")
-                    with _lock:
-                        why = tr.blocker(agent, actual)
-                        if why and cfg["dry_run"]:
-                            print(f"  ◌ would overrun — {why}")
-                            tr.force_charge(agent, actual, model=model, usage=usage,
-                                            status=code, vendor_cost=vendor, dry_run=True)
-                        elif why:  # the estimate was low and the money is already gone
-                            print(f"  ⚠ estimate was low — {why}")
-                            tr.force_charge(agent, actual, model=model, usage=usage,
-                                            status=code, vendor_cost=vendor)
-                            cfg["alert"]({"event": "overrun", "agent": agent, "model": model,
-                                          "reason": why, **tr.status()})
-                        else:
-                            tr.charge(agent, actual, model=model, usage=usage,
-                                      status=code, vendor_cost=vendor)
-                    print(f"  ✓ {code} {agent}/{model[:34]:<34} ${actual:.6f}  "
-                          f"${tr.spent:.4f}/${tr.limit:.2f}")
-            except Exception as e:
-                print(f"  ⚠ could not price response: {e}")
-
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                raw_usage = {}
+            self._bill(agent, model, raw_usage, code, i_rate, o_rate, estimate, held)
             self._out(code, payload, [("x-governer-spent", f"{tr.spent:.6f}"),
                                       ("x-governer-limit", f"{tr.limit:.2f}"),
                                       ("x-governer-agent", agent)])
@@ -808,6 +941,11 @@ def main(argv=None):
     c.add_argument("--fail-over", dest="fail_over", type=float,
                    help="exit 1 if true cost exceeds this (CI gate)")
     c.set_defaults(fn=cmd_check)
+
+    s = sub.add_parser("status", help="the meter: spent, burn rate, per-agent split")
+    s.add_argument("file")
+    s.add_argument("--limit", type=float)
+    s.set_defaults(fn=cmd_status)
 
     v = sub.add_parser("verify", help="check a ledger for tampering")
     v.add_argument("file")

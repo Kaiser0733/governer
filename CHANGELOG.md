@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.2 — 2026-10-26
+
+The "would this make someone poor?" audit. Two of these could have.
+
+- **Parallel requests could overspend a budget.** Eight simultaneous calls each saw the
+  same remaining balance, all passed the check, all billed — several times over the cap.
+  Estimates are now *held* while a request is in flight and settled against real usage.
+- **Streaming is supported.** It used to be refused, which made governer unusable with
+  the agent clients that stream by default. SSE is passed through untouched, with
+  `stream_options.include_usage` injected so the stream can still be billed.
+- **A request with no `usage` block was booked as free.** It now books the estimate
+  instead — for a money guard, assume the money is gone.
+- **A timeout was booked as free.** Same fix: if the provider may have run it, the
+  estimate is charged and flagged `assumed`.
+- **An unpriced model was enforced at $0.** It now warns on first sight, with the rate
+  it is using.
+- **New: `governer status`** — the meter. Spent, burn rate, projection, per-agent split,
+  and chain check. It refuses to project from a window under 30 minutes instead of
+  inventing a number.
+
 ## 1.0.1 — 2026-10-26
 
 Billing correctness. Found by auditing the money path line by line, not by a report.

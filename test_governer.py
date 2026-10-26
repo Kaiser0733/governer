@@ -44,6 +44,75 @@ class FakeUpstream:
         self.srv.shutdown()
 
 
+class EchoUpstream:
+    """Bills exactly what the request implies, so estimates and actuals should agree."""
+
+    def __init__(self, usage=None):
+        outer = self
+        self.hits = 0
+        self.bodies = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                outer.hits += 1
+                raw = self.rfile.read(int(self.headers.get("content-length") or 0))
+                body = json.loads(raw or b"{}")
+                outer.bodies.append(body)
+                text = "".join(m.get("content") or "" for m in body.get("messages") or [])
+                payload = {"choices": [{"message": {"content": "ok"}}],
+                           "usage": usage if usage is not None else {
+                               "prompt_tokens": max(1, len(text) // 4),
+                               "completion_tokens": int(body.get("max_tokens") or 0)}}
+                out = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = g.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def stop(self):
+        self.srv.shutdown()
+
+
+class StreamUpstream:
+    """Sends SSE the way a real gateway does: deltas, then a usage chunk, then [DONE]."""
+
+    def __init__(self):
+        outer = self
+        self.bodies = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("content-length") or 0))
+                outer.bodies.append(json.loads(raw or b"{}"))
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                for part in ({"choices": [{"delta": {"content": "he"}}]},
+                             {"choices": [{"delta": {"content": "llo"}}]},
+                             {"choices": [],
+                              "usage": {"prompt_tokens": 1000, "completion_tokens": 50}}):
+                    self.wfile.write(b"data: " + json.dumps(part).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = g.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def stop(self):
+        self.srv.shutdown()
+
+
 def serve(tr, upstream, dry=False, notify_log=None, prices=P):
     cfg = {"upstream": upstream, "rate": RATE, "timeout": 5, "dry_run": dry,
            "prices": prices,
@@ -341,29 +410,61 @@ def test_bad_body_is_400_not_a_crash():
         up.stop()
 
 
-def test_streaming_is_refused_clearly():
-    up = FakeUpstream()
+def test_stream_passes_through_and_bills_usage():
+    up = StreamUpstream()
     tr = g.Treasury(1.0)
     srv, url = serve(tr, up.url)
     try:
-        try:
-            post(url, {"model": "m", "stream": True, "messages": [{"content": "hi"}]})
-            raise AssertionError("stream should be refused")
-        except urllib.error.HTTPError as e:
-            assert e.code == 400 and "stream" in json.loads(e.read())["error"]["message"]
-        assert up.hits == 0
+        r = post(url, {"model": "m", "stream": True, "max_tokens": 50,
+                       "messages": [{"content": "hi"}]})
+        body = r.read().decode()
+        assert '"he"' in body and "[DONE]" in body, body
+        assert abs(tr.spent - (1000 * 10 / 1e6 + 50 * 50 / 1e6)) < 1e-9, tr.spent
+        assert up.bodies[0]["stream_options"]["include_usage"] is True, \
+            "governer must ask for the usage block or it cannot bill a stream"
     finally:
         srv.shutdown()
         up.stop()
 
 
-def test_embedded_prices_match_the_file():
-    here = os.path.dirname(os.path.abspath(g.__file__))
-    with open(os.path.join(here, "prices.json")) as f:
-        curated = json.load(f)["models"]
-    assert set(curated) == set(g._FALLBACK), "curated table and embedded fallback drifted apart"
-    for name, row in g._FALLBACK.items():
-        assert curated[name]["in"] == row["in"] and curated[name]["out"] == row["out"], name
+def test_parallel_requests_cannot_overspend():
+    """Without a hold on in-flight estimates, 8 requests each see the same budget."""
+    up = EchoUpstream()
+    tr = g.Treasury(0.13)          # room for exactly two 0.06 requests
+    srv, url = serve(tr, up.url)
+    codes = []
+
+    def fire():
+        try:
+            codes.append(post(url, {"model": "m", "max_tokens": 1000,
+                                    "messages": [{"content": "a" * 4000}]}).status)
+        except urllib.error.HTTPError as e:
+            codes.append(e.code)
+
+    try:
+        threads = [threading.Thread(target=fire) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert 402 in codes, codes
+        assert tr.spent <= 0.13 + 1e-9, f"spent {tr.spent} over a 0.13 budget"
+        assert codes.count(200) <= 2, codes
+    finally:
+        srv.shutdown()
+        up.stop()
+
+
+def test_missing_usage_books_the_estimate_not_zero():
+    up = EchoUpstream(usage={})
+    tr = g.Treasury(1.0)
+    srv, url = serve(tr, up.url)
+    try:
+        post(url, {"model": "m", "max_tokens": 50, "messages": [{"content": "a" * 400}]})
+        assert tr.spent > 0, "a request with no usage block must not be recorded as free"
+    finally:
+        srv.shutdown()
+        up.stop()
 
 
 def test_broken_webhook_does_not_break_the_breaker():

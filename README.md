@@ -56,6 +56,7 @@ Python 3.9+.
 | `governer prices --live` | every known model, cheapest first |
 | `governer prices --upcoming` | announced price changes — Gemini 3.8 Flash doubles 2027-01-01 |
 | `governer free` | which models are free *right now*, fetched live |
+| `governer status spend.jsonl --limit 20` | the meter: spent, burn rate, projection, per-agent split |
 | `governer verify ledger.jsonl` | checks a spend ledger for tampering |
 
 ## Put it in front of your agent
@@ -160,6 +161,36 @@ nobody typed it into a table.
 
 `governer check --fail-over 2.50` exits `1` when the run costs more. Tests
 should not be the only thing a PR can fail.
+
+## The meter, not just the wall
+
+A hard cap alone does not fix behaviour — it just moves the spending to the last week
+of the month. The number has to be in front of you while you decide whether to kick off
+another run.
+
+```
+$ governer status spend.jsonl --limit 20
+spent      $2.40 of $20.00  (12% used)
+burn rate  $0.40/h over 6.0h
+projected  $9.60/day at this rate
+runs out   in 44.0h at this rate
+agent      claude-code            $2.10
+agent      ci                     $0.30
+chain      OK — 3 records · $2.4000 · chain intact
+```
+
+It refuses to project from a window shorter than 30 minutes, because extrapolating three
+records in the same minute produces confident nonsense.
+
+## Why this instead of the other options
+
+| option | what it covers | what it misses |
+|---|---|---|
+| provider credit / key limits | a hard stop per account | not per agent, not cross-vendor, and it is exactly the layer that failed the $38k case |
+| an in-process library (`budget-guard`, npm) | a cap inside one Node app | one language, needs a code change, no help for a CLI agent you did not write |
+| an agent runtime with budgets (`cx`, Claude Extender) | caps for agents inside that runtime | requires adopting the whole runtime |
+| gateway budgets (litellm, OmniRoute) | budget fields in the gateway | enforcement is soft, and litellm's was silently bypassed (#26672) |
+| **governer** | any client in any language, no code change, cross-vendor, cache-aware pricing, tamper-evident ledger, CI gate, audit of logs you already have | one process per ledger — do not point two proxies at the same file |
 
 ## Why the bill explodes at night
 
