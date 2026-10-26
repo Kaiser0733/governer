@@ -704,6 +704,10 @@ def cmd_proxy(args):
 
 
 def main(argv=None):
+    try:  # a proxied log file must show lines as they happen, not at exit
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
     ap = argparse.ArgumentParser(prog="governer", description="hard spend governor for AI agents")
     ap.add_argument("--version", action="version", version=f"governer {__version__}")
     sub = ap.add_subparsers(dest="cmd")
