@@ -1,0 +1,27 @@
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: no dependencies to install
+        run: echo "governer uses the standard library only"
+      - name: tests
+        run: python3 test_governer.py
+      - name: the demo must trip the breaker
+        run: python3 governer.py box --limit 5 | grep -q "BREAKER TRIPPED"
+      - name: a budget gate must fail a PR that overspends
+        run: |
+          python3 -c "
+          import json
+          json.dump([{'input_tokens': 50000, 'output_tokens': 1000}] * 10, open('usage.json','w'))"
+          ! python3 governer.py check usage.json --model claude-opus-5-5 --fail-over 5

@@ -1,5 +1,7 @@
 # governer
 
+[![test](https://github.com/Kaiser0733/governer/actions/workflows/test.yml/badge.svg)](https://github.com/Kaiser0733/governer/actions/workflows/test.yml)
+
 **Your agent spent $37,901 while you slept. The budget alert told you afterwards.**
 
 `governer` prices every request the way the provider actually bills it — cache
