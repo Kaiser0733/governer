@@ -45,6 +45,8 @@ No pip, no dependencies, one file plus one price table. Python 3.9+.
 | `governer box` | simulated agent in a virtual wallet — watch the breaker trip, no key needed |
 | `governer check usage.json --limit 20` | true cost of a real log, plus where a $20 cap would have stopped it |
 | `governer prices` | what every model costs right now, with its verified date |
+| `governer prices --refresh` | pull live prices from the gateway — 459 models, cache pricing included |
+| `governer prices --live` | every known model, cheapest first |
 | `governer prices --upcoming` | announced price changes — Gemini 3.8 Flash doubles 2027-01-01 |
 | `governer free` | which models are free *right now*, fetched live |
 | `governer verify ledger.jsonl` | checks a spend ledger for tampering |
@@ -91,6 +93,20 @@ at $20.00 cap: stopped at request 39, $32.24 never spent (62% saved)
 Reads Anthropic (`input_tokens`), OpenAI (`prompt_tokens`) and OpenRouter
 (`cached_tokens`) field names, as a JSON array or JSONL.
 
+## It prices models nobody told it about
+
+```
+$ governer prices --refresh
+459 models refreshed from https://openrouter.ai/api/v1
+  free right now: 20
+  vendor-confirmed cache pricing: 313
+```
+
+Curated entries are hand-verified, each with a date and a source. Everything
+else is pulled live, so an agent that switches to a model released last week
+still gets priced — instead of silently costing nothing in your ledger because
+nobody typed it into a table.
+
 ## Gate a pull request on cost
 
 ```yaml
@@ -130,9 +146,9 @@ and open a PR when a vendor moves.
 ## Roadmap
 
 - ~~v0.2~~ proxy, live `free` check, CI gate — shipped
+- ~~v0.5~~ price table refreshed from the gateway instead of hand-maintained — shipped
 - **v0.3** per-agent and per-workflow budgets on one proxy
 - **v0.4** phone push the second a breaker trips
-- **v0.5** price table refreshed from vendor APIs instead of hand-maintained
 
 ## License
 

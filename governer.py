@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRICES_PATH = os.environ.get("GOVERNER_PRICES", os.path.join(HERE, "prices.json"))
+LIVE_PATH = os.environ.get("GOVERNER_LIVE", os.path.join(HERE, "prices.live.json"))
 
 # Provider logs spell the same field three ways. Accept all of them.
 ALIASES = {
@@ -39,9 +40,46 @@ ALIASES = {
 }
 
 
-def load_prices(path=PRICES_PATH):
+def load_curated(path=PRICES_PATH):
     with open(path) as f:
         return json.load(f)["models"]
+
+
+def load_prices(path=PRICES_PATH):
+    """Curated table first (hand-verified), then anything a live refresh found."""
+    models = dict(load_curated(path))
+    if os.path.exists(LIVE_PATH):
+        with open(LIVE_PATH) as f:
+            for name, row in json.load(f)["models"].items():
+                models.setdefault(name, row)
+    return models
+
+
+def fetch_live(api):
+    """Everything the gateway knows, with per-token prices turned into per-million."""
+    with urllib.request.urlopen(api.rstrip("/") + "/models", timeout=60) as r:
+        data = json.load(r)["data"]
+    models = {}
+    for m in data:
+        pr = m.get("pricing") or {}
+
+        def per_m(key):
+            try:
+                return round(float(pr[key]) * 1e6, 6)
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        row = {"in": per_m("prompt"), "out": per_m("completion"),
+               "cache_read": per_m("input_cache_read"),
+               "cache_write": per_m("input_cache_write"),
+               "ctx_in": m.get("context_length"), "name": m.get("name"),
+               "expires": m.get("expiration_date"),
+               "verified": now()[:10], "source": "openrouter.ai/api/v1/models"}
+        # routers report -1 when they cannot quote a price; skip them, they are not models
+        if row["in"] is not None and row["out"] is not None \
+                and row["in"] >= 0 and row["out"] >= 0:
+            models[m["id"]] = row
+    return models
 
 
 def now():
@@ -162,7 +200,33 @@ def verify_ledger(path):
 # ---------------------------------------------------------------- commands
 
 def cmd_prices(args):
-    prices = load_prices()
+    if args.refresh:
+        models = fetch_live(args.api)
+        with open(LIVE_PATH, "w") as f:
+            json.dump({"refreshed": now(), "source": args.api, "models": models},
+                      f, indent=1, sort_keys=True)
+        free = sum(1 for m in models.values() if m["in"] == 0 and m["out"] == 0)
+        cached = sum(1 for m in models.values() if m["cache_read"])
+        print(f"{len(models)} models refreshed from {args.api}")
+        print(f"  free right now: {free}")
+        print(f"  vendor-confirmed cache pricing: {cached}")
+        print(f"  saved to {LIVE_PATH}")
+        return
+    prices = load_curated()
+    if args.live:
+        prices = load_prices()
+        rows = sorted((p for p in prices.values() if p.get("in") is not None),
+                      key=lambda p: (p["in"], p["out"]))
+        if not args.all:
+            rows = rows[:40]
+        print(f"{'model':<50} {'in/M':>9} {'out/M':>9} {'cache r':>9}       ctx")
+        for p in rows:
+            cr = f"{p['cache_read']:.4f}" if p.get("cache_read") is not None else "-"
+            print(f"{(p.get('name') or '?')[:50]:<50} {p['in']:>9.4f} {p['out']:>9.4f} "
+                  f"{cr:>9}  {p.get('ctx_in') or '?':>9}")
+        print(f"\n{len(rows)} of {len(prices)} models — "
+              f"`governer prices --refresh` pulls what the gateway knows today")
+        return
     if args.upcoming:
         rows = [(m, c) for m, p in prices.items() for c in p.get("changes", [])]
         if not rows:
@@ -466,6 +530,10 @@ def main(argv=None):
 
     p = sub.add_parser("prices", help="what models cost right now")
     p.add_argument("--upcoming", action="store_true", help="announced price changes only")
+    p.add_argument("--refresh", action="store_true", help="pull live prices from a gateway")
+    p.add_argument("--live", action="store_true", help="list every known model, cheapest first")
+    p.add_argument("--all", action="store_true", help="do not truncate --live")
+    p.add_argument("--api", default="https://openrouter.ai/api/v1")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_prices)
 
