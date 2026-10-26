@@ -30,12 +30,19 @@ No API key, no network, ninety seconds.
 ## Install
 
 ```bash
+pipx install governer      # or: pip install governer
+governer box
+```
+
+No dependencies either way. Prefer a file? Two curls and you're done:
+
+```bash
 curl -O https://raw.githubusercontent.com/Kaiser0733/governer/main/governer.py
 curl -O https://raw.githubusercontent.com/Kaiser0733/governer/main/prices.json
 python3 governer.py box
 ```
 
-No pip, no dependencies, one file plus one price table. Python 3.9+.
+Python 3.9+.
 
 ## Commands
 
@@ -78,6 +85,41 @@ also how you *shadow-price* a free model to see what it would have cost:
 
 When the provider reports its own `cost` field, governer compares it against
 its own number and warns when `prices.json` has gone stale.
+
+### Budgets per agent, per day
+
+One proxy, several caps. Copy `governer.example.json` and pass it:
+
+```json
+{
+  "limit": 20.0,
+  "ledger": "spend.jsonl",
+  "notify": "https://ntfy.sh/your-topic",
+  "agents": {
+    "claude-code": { "limit": 5.0, "per": "day" },
+    "ci":          { "limit": 2.0, "per": "run" }
+  }
+}
+```
+
+```bash
+governer proxy --config governer.example.json
+```
+
+The agent names itself with a header — `X-Governer-Agent: claude-code` — and the
+cap applies to it alone. `day` resets at UTC midnight, `run` lasts the process.
+Both are rebuilt from the ledger on restart, so bouncing the proxy cannot reset a
+budget. `notify` receives a POST when the breaker trips.
+
+### Watch for a week before you enforce
+
+```bash
+governer proxy --limit 20 --dry-run --ledger spend.jsonl
+```
+
+Dry run books the true spend and refuses nothing, so you learn what a normal week
+costs before a cap starts costing you work. Anything it would have refused is
+marked `◌` in the console.
 
 ## Audit a log you already have
 
