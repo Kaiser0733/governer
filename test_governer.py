@@ -472,6 +472,30 @@ def test_broken_webhook_does_not_break_the_breaker():
     g.notify("", {"event": "x"})
 
 
+def test_embedded_prices_match_the_file():
+    """Restored: a bulk rewrite dropped this once, and nothing noticed."""
+    here = os.path.dirname(os.path.abspath(g.__file__))
+    with open(os.path.join(here, "prices.json")) as f:
+        curated = json.load(f)["models"]
+    assert set(curated) == set(g._FALLBACK), "curated table and embedded fallback drifted"
+    for name, row in g._FALLBACK.items():
+        assert curated[name]["in"] == row["in"] and curated[name]["out"] == row["out"], name
+
+
+def test_packaging_files_are_intact():
+    """open(path, "w").write(open(path).read()) truncated pyproject.toml to zero once."""
+    here = os.path.dirname(os.path.abspath(g.__file__))
+    text = open(os.path.join(here, "pyproject.toml")).read()
+    assert len(text) > 100, "pyproject.toml is empty or truncated"
+    assert f'version = "{g.__version__}"' in text, "pyproject version drifted from the module"
+    assert 'governer = "governer:main"' in text, "the console entry point is missing"
+    try:
+        import tomllib
+    except ImportError:
+        return  # python 3.9/3.10: the substring checks above still run
+    assert tomllib.loads(text)["project"]["name"] == "governer"
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
