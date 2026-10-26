@@ -47,8 +47,10 @@ governer prices --upcoming  # announced price rises
 
 - Ports and keys: the proxy never stores credentials; it passes the caller's
   own auth header upstream.
-- `stream: true` is refused on purpose — without the final usage block the
-  wallet cannot bill accurately.
+- Streaming works: SSE is passed through untouched and `stream_options.include_usage`
+  is added so the wallet can still bill it. Do not strip that field.
+- A response with no `usage` block, or a timeout, is charged at the estimate and
+  flagged `assumed`. That is deliberate — better to overcount than to record free spend.
 - If a provider reports its own `cost` field, governer compares it against its
   own arithmetic and warns when `prices.json` has gone stale. Treat that warning
   as a bug report against the price table, not against the request.

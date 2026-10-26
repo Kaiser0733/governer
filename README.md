@@ -76,9 +76,10 @@ Your agent keeps working unchanged. Every request is priced at its worst case
 real usage. Cross the limit and the request comes back `402` with
 `type: governer_breaker_tripped` — and your provider never sees it.
 
-Streaming is refused for now: the wallet needs the final `usage` block to bill
-accurately. Unpriced models fall back to `--default-in/--default-out`, which is
-also how you *shadow-price* a free model to see what it would have cost:
+Streaming passes straight through — governer adds `stream_options.include_usage`
+so the final usage block still arrives and the stream can be billed. Unpriced models
+fall back to `--default-in/--default-out`, which is also how you *shadow-price* a
+free model to see what it would have cost:
 
 ```
   ✓ 200 nvidia/nemotron-3.5-lightning:free    $0.001230  $0.0012/$5.00
